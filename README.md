@@ -1,6 +1,6 @@
-# Symbolic Algebra MCP Server
+# Symbolic Algebra MCP Server (lag-sympy-mcp)
 
-**This library is no longer maintained. It is Apache licensed, so feel free to fork it.**
+**This is a maintained fork of [sdiehl/sympy-mcp](https://github.com/sdiehl/sympy-mcp), which is no longer maintained upstream (Apache License 2.0).** It adds algebra and calculus tools (`factor_expression`, `expand_expression`, `cancel_expression`, `apart_expression`, `limit_expression`, `series_expansion`, `solve_inequality`) and a safe expression parser; see [MODIFICATIONS.md](MODIFICATIONS.md).
 
 Sympy-MCP is a Model Context Protocol server for allowing LLMs to autonomously perform symbolic mathematics and computer algebra. It exposes numerous tools from SymPy's core functionality to MCP clients for manipulating mathematical expressions and equations.
 
@@ -33,8 +33,8 @@ Then you can install and run the server with the following commands:
 
 ```shell
 # Setup the project
-git clone https://github.com/sdiehl/sympy-mcp.git
-cd sympy-mcp
+git clone https://github.com/laguchoritarik/lag-sympy-mcp.git
+cd lag-sympy-mcp
 uv sync
 
 # Install the server to Claude Desktop
@@ -46,11 +46,13 @@ uv run mcp run server.py
 
 You should see the server available in the Claude Desktop app now. For other clients, see below.
 
-If you want a completely standalone version that just runs with a single command, you can use the following. *Note this is running arbitrary code from Github, so be careful.*
+### Claude Code setup
 
 ```shell
-uv run --with https://github.com/sdiehl/sympy-mcp/releases/download/0.1/sympy_mcp-0.1.0-py3-none-any.whl python server.py
+claude mcp add --scope user sympy-mcp -- uv --directory /ABSOLUTE_PATH_TO/lag-sympy-mcp run mcp run server.py
 ```
+
+Replace `/ABSOLUTE_PATH_TO/lag-sympy-mcp` with the absolute path of your clone, then check the connection with `claude mcp list`.
 
 If you want to do general relativity calculations, you need to install the [`einsteinpy`](https://github.com/einsteinpy/einsteinpy) library.
 
@@ -210,9 +212,9 @@ VS Code and VS Code Insiders now support MCPs in [agent mode](https://code.visua
 
 1. **One-click Setup:**
 
-[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=sympy-mcp&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-p%22%2C%228081%3A8081%22%2C%22--rm%22%2C%22ghcr.io%2Fsdiehl%2Fsympy-mcp%3Amain%22%5D%7D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=sympy-mcp&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-p%22%2C%228081%3A8081%22%2C%22--rm%22%2C%22ghcr.io%2Flaguchoritarik%2Flag-sympy-mcp%3Amain%22%5D%7D)
 
-[![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=sympy-mcp&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-p%22%2C%228081%3A8081%22%2C%22--rm%22%2C%22ghcr.io%2Fsdiehl%2Fsympy-mcp%3Amain%22%5D%7D&quality=insiders)
+[![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=sympy-mcp&config=%7B%22command%22%3A%22docker%22%2C%22args%22%3A%5B%22run%22%2C%22-i%22%2C%22-p%22%2C%228081%3A8081%22%2C%22--rm%22%2C%22ghcr.io%2Flaguchoritarik%2Flag-sympy-mcp%3Amain%22%5D%7D&quality=insiders)
 
 OR manually add the config to your `settings.json` (global):
 
@@ -285,10 +287,10 @@ Alternatively, you can pull the pre-built image from GitHub Container Registry:
 
 ```bash
 # Pull the latest image
-docker pull ghcr.io/sdiehl/sympy-mcp:main
+docker pull ghcr.io/laguchoritarik/lag-sympy-mcp:main
 
 # Run the container
-docker run -p 8081:8081 --rm ghcr.io/sdiehl/sympy-mcp:main
+docker run -p 8081:8081 --rm ghcr.io/laguchoritarik/lag-sympy-mcp:main
 ```
 
 To configure Claude Desktop to launch the Docker container, edit your `claude_desktop_config.json` file:
@@ -324,7 +326,7 @@ Or to use the pre-built container from GitHub:
         "-p",
         "8081:8081",
         "--rm",
-        "ghcr.io/sdiehl/sympy-mcp:main"
+        "ghcr.io/laguchoritarik/lag-sympy-mcp:main"
       ]
     }
   }
