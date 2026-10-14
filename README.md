@@ -95,6 +95,13 @@ The sympy-mcp server provides the following tools for symbolic mathematics:
 | Matrix Inverse | `matrix_inverse` | Calculates the inverse of a matrix |
 | Eigenvalues | `matrix_eigenvalues` | Calculates the eigenvalues of a matrix |
 | Eigenvectors | `matrix_eigenvectors` | Calculates the eigenvectors of a matrix |
+| Factorization | `factor_expression` | Factors an expression over Q (optionally over Q(i) or GF(p)) |
+| Expansion | `expand_expression` | Expands products and integer powers of sums |
+| Rational Cancellation | `cancel_expression` | Puts a rational expression in canonical form p/q with common factors cancelled |
+| Partial Fractions | `apart_expression` | Computes the partial fraction decomposition of a rational expression |
+| Limit | `limit_expression` | Computes a limit at a finite point or at ±∞ (two-sided or one-sided) |
+| Series Expansion | `series_expansion` | Computes a Taylor/Laurent expansion with or without the O(...) remainder |
+| Inequality Solver | `solve_inequality` | Solves an inequality (or And/Or of inequalities) in one real variable |
 
 By default variables are predefined with assumptions (similar to how the [symbols()](https://docs.sympy.org/latest/modules/core.html#sympy.core.symbol.symbols) function works in SymPy). Unless otherwise specified the defaut assumptions is that a variable is complex, commutative, term over the complex field $\mathbb{C}$.
 
@@ -104,6 +111,37 @@ By default variables are predefined with assumptions (similar to how the [symbol
 | `complex` | true |
 | `finite` | true |
 | `infinite` | false |
+
+### Algebra and Calculus Tools
+
+These tools work on expressions already stored with `introduce_expression` and return a new
+expression key (print it with `print_latex_expression`), except `solve_inequality`, which returns
+the LaTeX of the solution set, like `solve_algebraically`. `factor_expression`, `expand_expression`,
+`cancel_expression` and `apart_expression` apply to both sides of an equation and to each entry of
+a matrix.
+
+| Tool | Parameters | Example input → output |
+|------|------------|------------------------|
+| `factor_expression` | `expr_key`, `gaussian=false`, `modulus=null` (prime) | `x**6 - 1` → `(x - 1)(x + 1)(x² - x + 1)(x² + x + 1)`; `x**2 + 1` with `gaussian=true` → `(x - i)(x + i)` |
+| `expand_expression` | `expr_key` | `(x + 1)**3` → `x³ + 3x² + 3x + 1` |
+| `cancel_expression` | `expr_key` | `(x**2 - 1)/(x**2 - 2*x + 1)` → `(x + 1)/(x - 1)` (formal cancellation) |
+| `apart_expression` | `expr_key`, `var_name` (required if several variables) | `1/(x**2 - 1)` → `1/(2(x - 1)) - 1/(2(x + 1))` |
+| `limit_expression` | `expr_key`, `var_name`, `point`, `direction` = `"+-"` (default) / `"+"` / `"-"` | `sin(x)/x`, `"0"` → `1`; `(1 + 1/x)**x`, `"oo"` → `e`; `1/x`, `"0"` → error (one-sided limits differ) |
+| `series_expansion` | `expr_key`, `var_name`, `point="0"`, `order=6` (1–50), `remove_order_term=false` | `exp(x)`, order 4 → `1 + x + x²/2 + x³/6 + O(x⁴)` |
+| `solve_inequality` | `expr_key`, `var_name` | `x**2 - 1 > 0` → `(-∞, -1) ∪ (1, ∞)`; `And(x > 0, x**2 < 4)` → `(0, 2)` |
+
+Notes:
+
+- `limit_expression` reports an error, rather than a value, when the limit does not exist: one-sided
+  limits that differ (`1/x`, `Abs(x)/x` at 0) or oscillation (`sin(x)` at `oo`).
+- Inequalities are solved over the reals. Write a double inequality `a < f(x) < b` as
+  `And(a < f(x), f(x) < b)`; Python's chained comparison is not supported by SymPy.
+- The `point` arguments of `limit_expression` and `series_expansion` are **not** passed to
+  `parse_expr`. They are parsed with Python's `ast` module against an allow-list: numbers,
+  introduced variables, `oo`/`inf`/`infinity`/`zoo`/`pi`/`E`/`I`, `+ - * / ** ^`, and the functions
+  `sqrt`, `exp`, `log`, `sin`, `cos`, `tan`, `Rational`. Anything else (attribute access, subscripts,
+  strings, keyword arguments, other calls, very large exact powers, inputs over 256 characters) is
+  rejected before evaluation.
 
 ## Claude Desktop Setup
 
@@ -449,6 +487,32 @@ $$A_1 \frac{dh_1}{dt} = Q - k(h_1 - h_2), \quad A_2 \frac{dh_2}{dt} = k(h_1 - h_
 ## Security Disclaimer
 
 This server runs on your computer and gives the language model access to run Python logic. Notably it uses Sympy's `parse_expr` to parse mathematical expressions, which is uses `eval` under the hood, effectively allowing arbitrary code execution. By running the server, you are trusting the code that Claude generates. Running in the Docker image is slightly safer, but it's still a good idea to review the code before running it.
+
+### `parse_expr` call sites
+
+The following tools pass client-supplied strings to `parse_expr` with SymPy's default global
+namespace (which includes Python builtins such as `__import__`, `open`, `eval`, `exec`):
+
+- `introduce_expression` (`expr_str`)
+- `integrate_expression` (`lower_bound`, `upper_bound`)
+- `create_vector_field` (component strings)
+- `create_matrix` (string entries)
+- `convert_to_units` (target unit strings)
+- `create_custom_metric` (component strings)
+
+For example `introduce_expression("__import__('os').getpid()")` executes the call. Passing
+`global_dict={}` is **not** a mitigation: `eval` re-inserts the complete `__builtins__` module into
+an empty globals dictionary, and object attribute traversal (`obj.__class__.__mro__...`) remains
+available regardless of the namespace. SymPy documents `parse_expr`/`sympify` as unsafe on untrusted
+input. Resource exhaustion is also possible (e.g. `10**10**10`), and no time limit is applied to any
+tool. With the HTTP transports the server binds to `0.0.0.0` by default, which exposes these
+risks to the network; prefer `--mcp-host 127.0.0.1` or the stdio transport.
+
+The algebra/calculus tools added in this fork (`factor_expression`, `expand_expression`,
+`cancel_expression`, `apart_expression`, `limit_expression`, `series_expansion`,
+`solve_inequality`) never call `parse_expr`, `sympify` or `eval` themselves; their only string
+inputs are parsed by the allow-list parser described above. They still operate on expressions that
+were created through `introduce_expression`, so they do not remove the risk of that entry point.
 
 
 ## License

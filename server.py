@@ -1,3 +1,4 @@
+# Modified by laguchoritarik (2026): new algebra/calculus tools and a safe parser; see MODIFICATIONS.md.
 # A stateful MCP server that holds a sympy session, with symbol table of variables
 # that can be used in the tools API to define and manipulate expressions.
 
@@ -5,6 +6,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 import httpx
+import ast
 import json
 import sympy
 import argparse
@@ -13,7 +15,16 @@ from typing import List, Dict, Optional, Literal, Any, Union
 from pydantic import BaseModel
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.core.facts import InconsistentAssumptions
-from vars import Assumption, Domain, ODEHint, PDEHint, Metric, Tensor, UnitSystem
+from vars import (
+    Assumption,
+    Domain,
+    ODEHint,
+    PDEHint,
+    Metric,
+    Tensor,
+    UnitSystem,
+    LimitDirection,
+)
 from sympy import Eq, Function, dsolve, diff, integrate, simplify, Matrix
 from sympy.solvers.pde import pdsolve
 from sympy.vector import CoordSys3D, curl, divergence, gradient
@@ -1884,6 +1895,460 @@ def substitute_expression(
         return result_key
     except Exception as e:
         return f"Error during substitution: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Safe parsing of small numeric/symbolic arguments (limit points, series centers)
+#
+# The tools below never call parse_expr/sympify/eval on user strings. Point
+# arguments are parsed with Python's `ast` module and converted node by node
+# into SymPy objects from an explicit allow-list: numbers, introduced
+# variables, a few constants, arithmetic operators and a few elementary
+# functions. Attribute access, subscripts, keyword arguments, lambdas,
+# comprehensions, strings, etc. are rejected before anything is evaluated.
+# ---------------------------------------------------------------------------
+
+MAX_SAFE_EXPR_LENGTH = 256
+MAX_SAFE_POW_BITS = 100_000
+MAX_SERIES_ORDER = 50
+
+_SAFE_CONSTANTS = {
+    "oo": sympy.oo,
+    "inf": sympy.oo,
+    "infinity": sympy.oo,
+    "zoo": sympy.zoo,
+    "pi": sympy.pi,
+    "E": sympy.E,
+    "I": sympy.I,
+}
+
+_SAFE_FUNCTIONS = {
+    "sqrt": sympy.sqrt,
+    "exp": sympy.exp,
+    "log": sympy.log,
+    "sin": sympy.sin,
+    "cos": sympy.cos,
+    "tan": sympy.tan,
+    "Rational": sympy.Rational,
+}
+
+
+class UnsafeExpressionError(ValueError):
+    """Raised when a string argument contains a construct outside the allow-list."""
+
+
+def _safe_pow(base: sympy.Basic, exponent: sympy.Basic) -> sympy.Basic:
+    # Refuse exact powers whose result would be astronomically large.
+    if base.is_Rational and exponent.is_Integer and abs(exponent) > 1:
+        base_bits = abs(base.p).bit_length() + base.q.bit_length()
+        if base_bits * abs(int(exponent)) > MAX_SAFE_POW_BITS:
+            raise UnsafeExpressionError("power too large")
+    return sympy.Pow(base, exponent)
+
+
+def _convert_safe_node(node: ast.AST) -> sympy.Basic:
+    if isinstance(node, ast.Expression):
+        return _convert_safe_node(node.body)
+
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise UnsafeExpressionError(f"unsupported literal {value!r}")
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise UnsafeExpressionError("non-finite float literal")
+            return sympy.Float(repr(value))
+        return sympy.Integer(value)
+
+    if isinstance(node, ast.Name):
+        if node.id in local_vars:
+            return local_vars[node.id]
+        if node.id in _SAFE_CONSTANTS:
+            return _SAFE_CONSTANTS[node.id]
+        raise UnsafeExpressionError(f"unknown name '{node.id}'")
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _convert_safe_node(node.operand)
+        return -operand if isinstance(node.op, ast.USub) else operand
+
+    if isinstance(node, ast.BinOp):
+        left = _convert_safe_node(node.left)
+        right = _convert_safe_node(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, (ast.Pow, ast.BitXor)):
+            return _safe_pow(left, right)
+        raise UnsafeExpressionError(f"unsupported operator {type(node.op).__name__}")
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCTIONS:
+            raise UnsafeExpressionError(
+                "only sqrt, exp, log, sin, cos, tan, Rational may be called"
+            )
+        if node.keywords or not 1 <= len(node.args) <= 2:
+            raise UnsafeExpressionError("unsupported call arguments")
+        args = [_convert_safe_node(arg) for arg in node.args]
+        return _SAFE_FUNCTIONS[node.func.id](*args)
+
+    raise UnsafeExpressionError(f"unsupported syntax {type(node).__name__}")
+
+
+def parse_safe_expression(expr_str: str) -> sympy.Basic:
+    """Converts a small arithmetic string into a SymPy object without eval.
+
+    Accepts numbers, introduced variables, oo/inf/zoo/pi/E/I, + - * / ** ^,
+    unary minus and the functions sqrt, exp, log, sin, cos, tan, Rational.
+    """
+    if not isinstance(expr_str, str):
+        raise UnsafeExpressionError("expression must be a string")
+    if len(expr_str) > MAX_SAFE_EXPR_LENGTH:
+        raise UnsafeExpressionError("expression too long")
+    try:
+        tree = ast.parse(expr_str.strip(), mode="eval")
+    except SyntaxError as e:
+        raise UnsafeExpressionError(f"invalid syntax: {e.msg}") from None
+    return _convert_safe_node(tree)
+
+
+def _store_result(result: Any) -> str:
+    global expression_counter
+    result_key = f"expr_{expression_counter}"
+    expressions[result_key] = result
+    expression_counter += 1
+    return result_key
+
+
+def _map_expression(expr: Any, transform) -> Any:
+    """Applies a transformation to an expression, both sides of a relation, or each matrix entry."""
+    if isinstance(expr, sympy.MatrixBase):
+        return expr.applyfunc(transform)
+    if isinstance(expr, sympy.core.relational.Relational):
+        return expr.func(transform(expr.lhs), transform(expr.rhs), evaluate=False)
+    return transform(expr)
+
+
+@mcp.tool()
+def factor_expression(
+    expr_key: str, gaussian: bool = False, modulus: Optional[int] = None
+) -> str:
+    """Factors a polynomial or rational expression using SymPy's factor function.
+
+    By default the factorization is over the rationals. Equations are factored side by side.
+
+    Args:
+        expr_key: The key of the expression (previously introduced) to factor.
+        gaussian: If True, factor over the Gaussian rationals Q(i), e.g. x**2 + 1 = (x - i)(x + i).
+        modulus: Optional prime p to factor over the finite field GF(p).
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("x**6 - 1")
+        result_key = factor_expression(expr_key)
+        # (x - 1)(x + 1)(x^2 - x + 1)(x^2 + x + 1)
+
+    Returns:
+        A key for the factored expression.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    if gaussian and modulus is not None:
+        return "Error: 'gaussian' and 'modulus' cannot be used together."
+
+    options: Dict[str, Any] = {}
+    if gaussian:
+        options["gaussian"] = True
+    if modulus is not None:
+        if modulus < 2 or not sympy.isprime(modulus):
+            return f"Error: modulus must be a prime number, got {modulus}."
+        options["modulus"] = modulus
+
+    try:
+        result = _map_expression(
+            expressions[expr_key], lambda e: sympy.factor(e, **options)
+        )
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during factorization: {str(e)}"
+
+
+@mcp.tool()
+def expand_expression(expr_key: str) -> str:
+    """Expands an expression algebraically using SymPy's expand function.
+
+    Distributes products and expands integer powers of sums. Equations are expanded side by side.
+
+    Args:
+        expr_key: The key of the expression (previously introduced) to expand.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("(x + 1)**3")
+        result_key = expand_expression(expr_key)
+        # x^3 + 3x^2 + 3x + 1
+
+    Returns:
+        A key for the expanded expression.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    try:
+        result = _map_expression(expressions[expr_key], sympy.expand)
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during expansion: {str(e)}"
+
+
+@mcp.tool()
+def cancel_expression(expr_key: str) -> str:
+    """Puts a rational expression in canonical form p/q with common factors cancelled.
+
+    Uses SymPy's cancel function. Cancellation is formal: (x**2 - 1)/(x - 1)
+    becomes x + 1, even though the original is undefined at x = 1.
+
+    Args:
+        expr_key: The key of the expression (previously introduced) to cancel.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("(x**2 - 1)/(x**2 - 2*x + 1)")
+        result_key = cancel_expression(expr_key)
+        # (x + 1)/(x - 1)
+
+    Returns:
+        A key for the simplified rational expression.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    try:
+        result = _map_expression(expressions[expr_key], sympy.cancel)
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during cancellation: {str(e)}"
+
+
+@mcp.tool()
+def apart_expression(expr_key: str, var_name: Optional[str] = None) -> str:
+    """Computes the partial fraction decomposition of a rational expression using SymPy's apart.
+
+    Args:
+        expr_key: The key of the expression (previously introduced) to decompose.
+        var_name: The variable (previously introduced) to decompose with respect to.
+            Required when the expression has several variables.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("1/(x**2 - 1)")
+        result_key = apart_expression(expr_key, "x")
+        # -1/(2(x + 1)) + 1/(2(x - 1))
+
+    Returns:
+        A key for the decomposed expression.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    var = None
+    if var_name is not None:
+        if var_name not in local_vars:
+            return f"Error: Variable '{var_name}' not found. Please introduce it first."
+        var = local_vars[var_name]
+
+    try:
+        result = _map_expression(expressions[expr_key], lambda e: sympy.apart(e, var))
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during partial fraction decomposition: {str(e)}"
+
+
+@mcp.tool()
+def limit_expression(
+    expr_key: str,
+    var_name: str,
+    point: str,
+    direction: LimitDirection = LimitDirection.BOTH,
+) -> str:
+    """Computes the limit of an expression as a variable tends to a point, using SymPy's limit.
+
+    Args:
+        expr_key: The key of the expression (previously introduced).
+        var_name: The variable (previously introduced) that tends to the point.
+        point: The limit point, e.g. "0", "1/2", "pi/2", "oo" (+infinity), "-oo".
+            Parsed without eval: only numbers, introduced variables, oo/inf/pi/E/I,
+            arithmetic operators and sqrt/exp/log/sin/cos/tan/Rational are accepted.
+        direction: "+-" for the two-sided limit (default), "+" from the right, "-" from the left.
+            Ignored for limits at +oo or -oo.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("sin(x)/x")
+        result_key = limit_expression(expr_key, "x", "0")
+        # 1
+        expr_key = introduce_expression("(1 + 1/x)**x")
+        result_key = limit_expression(expr_key, "x", "oo")
+        # e
+
+    Returns:
+        A key for the limit. Returns an error message if the limit does not exist
+        (one-sided limits differ, or the expression oscillates).
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    if var_name not in local_vars:
+        return f"Error: Variable '{var_name}' not found. Please introduce it first."
+
+    try:
+        point_value = parse_safe_expression(point)
+    except UnsafeExpressionError as e:
+        return f"Error: Invalid limit point '{point}': {str(e)}"
+
+    try:
+        expr = expressions[expr_key]
+        var = local_vars[var_name]
+        if point_value in (sympy.oo, -sympy.oo):
+            result = sympy.limit(expr, var, point_value)
+        elif direction == LimitDirection.BOTH:
+            # SymPy's "+-" returns zoo when the one-sided limits are -oo and +oo
+            # (e.g. 1/x at 0); compare the one-sided limits explicitly instead.
+            right = sympy.limit(expr, var, point_value, dir="+")
+            left = sympy.limit(expr, var, point_value, dir="-")
+            if right != left:
+                return (
+                    f"Error: The two-sided limit does not exist: left limit = "
+                    f"{sympy.latex(left)}, right limit = {sympy.latex(right)}."
+                )
+            result = right
+        else:
+            result = sympy.limit(expr, var, point_value, dir=direction.value)
+        if isinstance(result, sympy.AccumBounds):
+            return (
+                f"Error: The limit does not exist: the expression oscillates "
+                f"within {sympy.latex(result)}."
+            )
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during limit computation: {str(e)}"
+
+
+@mcp.tool()
+def series_expansion(
+    expr_key: str,
+    var_name: str,
+    point: str = "0",
+    order: int = 6,
+    remove_order_term: bool = False,
+) -> str:
+    """Computes a Taylor/Laurent/Puiseux expansion (développement limité) using SymPy's series.
+
+    Args:
+        expr_key: The key of the expression (previously introduced) to expand.
+        var_name: The variable (previously introduced) of the expansion.
+        point: The expansion point, e.g. "0", "1", "pi/2", "oo". Parsed without eval
+            with the same rules as limit_expression. Defaults to "0".
+        order: Terms up to (var - point)**(order - 1) are kept, followed by O((var - point)**order).
+            Must be between 1 and 50. Defaults to 6.
+        remove_order_term: If True, drop the O(...) remainder and return the truncated polynomial.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("exp(x)")
+        result_key = series_expansion(expr_key, "x", "0", 4)
+        # 1 + x + x^2/2 + x^3/6 + O(x^4)
+
+    Returns:
+        A key for the expansion.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    if var_name not in local_vars:
+        return f"Error: Variable '{var_name}' not found. Please introduce it first."
+
+    if not 1 <= order <= MAX_SERIES_ORDER:
+        return f"Error: order must be between 1 and {MAX_SERIES_ORDER}, got {order}."
+
+    try:
+        point_value = parse_safe_expression(point)
+    except UnsafeExpressionError as e:
+        return f"Error: Invalid expansion point '{point}': {str(e)}"
+
+    try:
+        var = local_vars[var_name]
+        result = sympy.series(expressions[expr_key], var, x0=point_value, n=order)
+        if remove_order_term:
+            result = result.removeO()
+        return _store_result(result)
+    except Exception as e:
+        return f"Error during series expansion: {str(e)}"
+
+
+def _solve_real_inequality(condition: Any, var: sympy.Symbol) -> sympy.Set:
+    if condition is sympy.true:
+        return sympy.S.Reals
+    if condition is sympy.false:
+        return sympy.S.EmptySet
+    if isinstance(condition, sympy.And):
+        return sympy.Intersection(
+            *[_solve_real_inequality(arg, var) for arg in condition.args]
+        )
+    if isinstance(condition, sympy.Or):
+        return sympy.Union(*[_solve_real_inequality(arg, var) for arg in condition.args])
+    if isinstance(condition, sympy.Not):
+        return sympy.Complement(
+            sympy.S.Reals, _solve_real_inequality(condition.args[0], var)
+        )
+    if isinstance(condition, sympy.core.relational.Relational) and not isinstance(
+        condition, sympy.Eq
+    ):
+        return sympy.solveset(condition, var, domain=sympy.S.Reals)
+    raise ValueError(
+        "expected an inequality (<, <=, >, >=, Ne) or an And/Or/Not combination of them"
+    )
+
+
+@mcp.tool()
+def solve_inequality(expr_key: str, var_name: str) -> str:
+    """Solves an inequality in one real variable using SymPy's solveset over the reals.
+
+    The inequality is introduced with introduce_expression, e.g. "x**2 - 1 > 0",
+    "(x - 1)/(x + 2) <= 0", or a combination "And(x > 0, x**2 < 4)" / "Or(...)".
+    For a double inequality a < f(x) < b use "And(a < f(x), f(x) < b)".
+
+    Args:
+        expr_key: The key of the inequality (previously introduced).
+        var_name: The variable (previously introduced) to solve for.
+
+    Example:
+        intro("x", [Assumption.REAL], [])
+        expr_key = introduce_expression("x**2 - 1 > 0")
+        solve_inequality(expr_key, "x")
+        # \\left(-\\infty, -1\\right) \\cup \\left(1, \\infty\\right)
+
+    Returns:
+        A LaTeX string representing the solution set. Returns an error message string if issues occur.
+    """
+    if expr_key not in expressions:
+        return f"Error: Expression with key '{expr_key}' not found."
+
+    if var_name not in local_vars:
+        return f"Error: Variable '{var_name}' not found. Please introduce it first."
+
+    try:
+        solution_set = _solve_real_inequality(
+            expressions[expr_key], local_vars[var_name]
+        )
+        return sympy.latex(solution_set)
+    except Exception as e:
+        return f"Error solving inequality: {str(e)}"
 
 
 def main():

@@ -1,3 +1,4 @@
+# Modified by laguchoritarik (2026): new algebra/calculus tools and a safe parser; see MODIFICATIONS.md.
 from enum import Enum
 
 
@@ -151,3 +152,9 @@ class UnitSystem(Enum):
     NATURAL = "natural"
     SI = "SI"
     CGS = "cgs"
+
+
+class LimitDirection(Enum):
+    BOTH = "+-"
+    RIGHT = "+"
+    LEFT = "-"
